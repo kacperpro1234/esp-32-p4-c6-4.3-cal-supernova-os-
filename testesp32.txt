@@ -1,0 +1,589 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <SD_MMC.h>
+#include <time.h>
+#include <Preferences.h> 
+
+#include "src/st7701_lcd.h"
+#include "src/font_map.h"
+
+// ================== KONFIGURACJA ==================
+const char* ssid     = "NETIASPOT-7Xxj";
+const char* password = "duuCXJ8kcCVh5";
+
+#define SCR_W 480
+#define SCR_H 800
+
+// ================== ZMIENNE GLOBALNE ==================
+st7701_lcd lcd(5);
+WebServer server(8080);
+Preferences preferences; 
+
+uint16_t* frame = nullptr;
+
+struct Stats {
+    int   cpu_t;
+    int   cpu_l;
+    float cpu_ghz;
+
+    int   gpu_t;
+    int   gpu_l;
+
+    float ram_used;
+    float ram_free;
+
+    float vram_used;
+    float vram_free;
+} pc;
+
+String tempText = "--C";
+String weatherText = "Brak danych";
+String spotifyText = ""; 
+
+bool   animEnabled = true;
+String currentBmp  = "";
+String animFolder  = "/animacje/fire";
+int    animFrame   = 1;
+
+uint16_t dashColor = 0x07E0; 
+uint8_t  dashAlpha = 120; 
+String   CITY = "Katowice";
+
+unsigned long lastDataReceived = 0;
+
+// ================== OPERACJE NA FRAMEBUFFERZE ==================
+inline void fbDrawPixel(int x, int y, uint16_t color) {
+    if (x < 0 || x >= SCR_W || y < 0 || y >= SCR_H) return;
+    frame[y * SCR_W + x] = color;
+}
+
+void fbClear(uint16_t color = 0x0000) {
+    for (int i = 0; i < SCR_W * SCR_H; i++) frame[i] = color;
+}
+
+void fbPush() {
+    lcd.draw16bitbergbbitmap(0, 0, SCR_W, SCR_H, frame);
+}
+
+void fillRectFB(int x_land, int y_land, int w_land, int h_land, uint16_t color) {
+    for (int i = x_land; i < x_land + w_land; i++) {
+        for (int j = y_land; j < y_land + h_land; j++) {
+            fbDrawPixel(j, i, color);
+        }
+    }
+}
+
+void fillRectAlphaFB(int x_land, int y_land, int w_land, int h_land, uint16_t color, uint8_t alpha) {
+    if (alpha == 0) return;
+    if (alpha == 255) { fillRectFB(x_land, y_land, w_land, h_land, color); return; }
+
+    uint8_t r_fg = (color >> 11) & 0x1F;
+    uint8_t g_fg = (color >> 5) & 0x3F;
+    uint8_t b_fg = color & 0x1F;
+
+    for (int i = x_land; i < x_land + w_land; i++) {
+        for (int j = y_land; j < y_land + h_land; j++) {
+            if (i < 0 || i >= SCR_H || j < 0 || j >= SCR_W) continue;
+            uint16_t bg_color = frame[i * SCR_W + j];
+            uint8_t r_bg = (bg_color >> 11) & 0x1F;
+            uint8_t g_bg = (bg_color >> 5) & 0x3F;
+            uint8_t b_bg = bg_color & 0x1F;
+            uint8_t r_out = (r_fg * alpha + r_bg * (255 - alpha)) / 255;
+            uint8_t g_out = (g_fg * alpha + g_bg * (255 - alpha)) / 255;
+            uint8_t b_out = (b_fg * alpha + b_bg * (255 - alpha)) / 255;
+            frame[i * SCR_W + j] = (r_out << 11) | (g_out << 5) | b_out;
+        }
+    }
+}
+
+void drawBMP(String path) {
+    File f = SD_MMC.open(path);
+    if (!f) return;
+    uint8_t header[54];
+    if (f.read(header, 54) != 54) { f.close(); return; }
+    int w = *(int*)&header[18];
+    int h = *(int*)&header[22];
+    int rowSize = ((24 * w + 31) / 32) * 4;
+    uint8_t* row = (uint8_t*)malloc(rowSize);
+    if (!row) { f.close(); return; }
+    for (int y = 0; y < SCR_H; y++) {
+        f.seek(54 + ((y * h) / SCR_H) * rowSize);
+        f.read(row, rowSize);
+        for (int x = 0; x < SCR_W; x++) {
+            int sx = (x * w) / SCR_W;
+            uint16_t color = ((row[sx * 3 + 2] & 0xF8) << 8) | ((row[sx * 3 + 1] & 0xFC) << 3) | (row[sx * 3 + 0] >> 3);
+            frame[(SCR_H - 1 - y) * SCR_W + (SCR_W - 1 - x)] = color;
+        }
+    }
+    free(row); f.close();
+}
+
+void drawStringFB(int x, int y, String text, uint16_t color, int scale) {
+    int charW = 6 * scale;
+    int charH = 8 * scale;
+    for (int i = 0; i < text.length(); i++) {
+        int idx;
+        if ((uint8_t)text[i] == 216 || (uint8_t)text[i] == 152) { idx = 95; }
+        else { idx = toupper(text[i]) - 32; }
+        
+        if (idx < 0 || idx > 95) idx = 0;
+        
+        for (int col = 0; col < 5; col++) {
+            uint8_t bits = font_pixels[idx][col];
+            for (int row = 0; row < 7; row++) {
+                if (bits & (1 << row)) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        for (int sy = 0; sy < scale; sy++) {
+                            fbDrawPixel(y + (charH - 1 - (row * scale + sy)), x + (i * charW + col * scale + sx), color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ================== RYSOWANIE IKONY WIFI ==================
+void drawWiFiIcon(int x_land, int y_land, int rssi) {
+    int bars = 0;
+    if (rssi > -65) bars = 4;
+    else if (rssi > -75) bars = 3;
+    else if (rssi > -85) bars = 2;
+    else if (rssi < 0) bars = 1;
+
+    uint16_t activeColor = 0xFFFF; // biały
+    uint16_t inactiveColor = 0x4208; // ciemnoszary
+
+    // Rysujemy 4 pionowe kreski sygnału
+    for (int i = 0; i < 4; i++) {
+        int w = 6;
+        int h = (i + 1) * 5; // wysokosci: 5, 10, 15, 20
+        int px = x_land + (i * 9); // odstep miedzy kreskami
+        int py = y_land + (20 - h);
+        uint16_t color = (i < bars) ? activeColor : inactiveColor;
+        fillRectFB(px, py, w, h, color);
+    }
+}
+
+// ================== POGODA (HTTPClient) ==================
+void updateWeather() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    HTTPClient http;
+    String citySafe = CITY; 
+    citySafe.replace(" ", "%20"); 
+    http.begin("http://wttr.in/" + citySafe + "?format=j1");
+    if (http.GET() == 200) {
+        StaticJsonDocument<8192> doc;
+        deserializeJson(doc, http.getString());
+        tempText = String(doc["current_condition"][0]["temp_C"].as<const char*>()) + "C";
+        weatherText = String(doc["current_condition"][0]["weatherDesc"][0]["value"].as<const char*>());
+    }
+    http.end();
+}
+
+// ================== DASHBOARD ==================
+void drawDashboardOverlay() {
+    uint16_t white = 0xFFFF;
+    char buf[64];
+    
+    // --- ŚRODKOWY OBSZAR (Statystyki) ---
+    fillRectAlphaFB(0, 70, 800, 370, 0x0000, dashAlpha);
+    
+    // --- GÓRNY PASEK ---
+    uint8_t topBarAlpha = dashAlpha + 60;
+    if (dashAlpha == 0) topBarAlpha = 90;
+    if (topBarAlpha > 255 || dashAlpha > 195) topBarAlpha = 255; 
+    
+    fillRectAlphaFB(0, 440, 800, 40, 0x0000, topBarAlpha);
+    
+    // Data (lewa strona górnego paska)
+    time_t now = time(nullptr);
+    if (now > 100000) {
+        struct tm* t = localtime(&now);
+        char dateBuf[32]; 
+        strftime(dateBuf, sizeof(dateBuf), "%d.%m.%Y", t);
+        drawStringFB(20, 452, String(dateBuf), white, 2); 
+    } else {
+        drawStringFB(20, 452, "Czekam na NTP", white, 2);
+    }
+
+    // Nowa ikona WiFi (prawa strona górnego paska)
+    drawStringFB(670, 452, "WiFi", white, 2);
+    drawWiFiIcon(730, 450, WiFi.RSSI());
+
+    // --- STATYSTYKI PC ---
+    drawStringFB(40, 390, weatherText, white, 2);
+    sprintf(buf, "CPU: %3dC %3d%% %4.2fGHz", pc.cpu_t, pc.cpu_l, pc.cpu_ghz);
+    drawStringFB(40, 330, String(buf), dashColor, 3);
+    sprintf(buf, "GPU: %3dC %3d%%", pc.gpu_t, pc.gpu_l);
+    drawStringFB(40, 270, String(buf), dashColor, 3);
+    sprintf(buf, "RAM: %4.1f GB uzyte | %4.1f GB wolne", pc.ram_used, pc.ram_free);
+    drawStringFB(40, 210, String(buf), dashColor, 3);
+    sprintf(buf, "VRAM: %4.1f GB uzyte | %4.1f GB wolne", pc.vram_used, pc.vram_free);
+    drawStringFB(40, 150, String(buf), dashColor, 3);
+
+
+    // --- DOLNY PASEK ---
+    fillRectFB(0, 0, 800, 70, 0x0000);
+    fillRectFB(0, 67, 800, 3, dashColor); 
+
+    drawStringFB(20, 20, tempText, white, 4);
+    
+    if (spotifyText != "" && spotifyText != "null") {
+        String s = spotifyText;
+        if (s.length() > 26) s = s.substring(0, 23) + "..."; 
+        drawStringFB(190, 25, s, 0x1DEB, 2);
+    } else {
+        drawStringFB(190, 25, "Brak muzyki", 0x7BEF, 2);
+    }
+
+    if (now > 100000) {
+        struct tm* t = localtime(&now);
+        char tBuf[16]; strftime(tBuf, sizeof(tBuf), "%H:%M:%S", t);
+        drawStringFB(560, 20, String(tBuf), white, 4);
+    }
+}
+
+void drawDisconnectedScreen() {
+    fbClear(0x0000);
+    drawStringFB(150, 280, "BRAK POlACZENIA Z PC", 0xF800, 4); 
+    drawStringFB(200, 220, "IP: " + WiFi.localIP().toString(), 0xFFFF, 3);
+    drawStringFB(200, 160, "PORT: 8080", 0xFFFF, 3);
+    
+    // Dolny pasek błędu
+    fillRectFB(0, 0, 800, 70, 0x0000);
+    fillRectFB(0, 67, 800, 3, 0xF800); 
+    drawStringFB(20, 20, tempText, 0xFFFF, 4);
+    
+    // Górny pasek błędu
+    fillRectAlphaFB(0, 440, 800, 40, 0x0000, 150);
+    
+    time_t now = time(nullptr);
+    if (now > 100000) {
+        struct tm* t = localtime(&now);
+        char tBuf[16]; strftime(tBuf, sizeof(tBuf), "%H:%M:%S", t);
+        drawStringFB(560, 20, String(tBuf), 0xFFFF, 4);
+        
+        char dateBuf[16]; strftime(dateBuf, sizeof(dateBuf), "%d.%m.%Y", t);
+        drawStringFB(20, 452, String(dateBuf), 0xFFFF, 2);
+    }
+    
+    drawStringFB(670, 452, "WiFi", 0xFFFF, 2);
+    drawWiFiIcon(730, 450, WiFi.RSSI());
+
+    fbPush();
+}
+
+void updateDashboardStatic() {
+    fbClear();
+    if (currentBmp != "") { drawBMP(currentBmp); }
+    drawDashboardOverlay();
+    fbPush();
+}
+
+void drawAnimFrame() {
+    char path[128];
+    sprintf(path, "%s/%d.bmp", animFolder.c_str(), animFrame);
+    if (!SD_MMC.exists(path)) { 
+        animFrame = 1; 
+        sprintf(path, "%s/%d.bmp", animFolder.c_str(), animFrame);
+    }
+    drawBMP(String(path));
+    animFrame++;
+    if (animFrame > 50) animFrame = 1; 
+}
+
+void updateDashboardAnimated() {
+    drawAnimFrame();
+    drawDashboardOverlay();
+    fbPush();
+}
+
+// ================== SERWER UPDATES ==================
+void handleUpdate() {
+    if (!server.hasArg("plain")) { server.send(400, "text/plain", "Brak danych"); return; }
+    
+    StaticJsonDocument<1024> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (err) { server.send(400, "text/plain", "Zly JSON"); return; }
+    
+    pc.cpu_t = doc["cpu_t"]; pc.cpu_l = doc["cpu_l"]; pc.cpu_ghz = doc["cpu_ghz"];
+    pc.gpu_t = doc["gpu_t"]; pc.gpu_l = doc["gpu_l"];
+    pc.ram_used = doc["ram_used"]; pc.ram_free = doc["ram_free"];
+    pc.vram_used = doc["vram_used"]; pc.vram_free = doc["vram_free"];
+    
+    if (doc.containsKey("spotify")) { spotifyText = doc["spotify"].as<String>(); }
+    
+    if (doc.containsKey("weather_temp") && doc["weather_temp"] != "--C") { tempText = doc["weather_temp"].as<String>(); }
+    if (doc.containsKey("weather_desc")) { weatherText = doc["weather_desc"].as<String>(); }
+    
+    lastDataReceived = millis(); 
+    server.send(200, "text/plain", "OK");
+}
+
+// ================== SD MANAGER ==================
+String safePath(String p) {
+    if (!p.startsWith("/")) p = "/" + p;
+    if (p.length() > 1 && p.endsWith("/")) p.remove(p.length() - 1);
+    return p;
+}
+
+void listDirHTML(String path, String &html) {
+    path = safePath(path);
+    File dir = SD_MMC.open(path);
+    if (!dir || !dir.isDirectory()) { html += "<p>Folder nie istnieje.</p>"; return; }
+    html += "<ul>";
+    if (path != "/") {
+        int lastSlash = path.lastIndexOf('/');
+        String parent = (lastSlash == 0) ? "/" : path.substring(0, lastSlash);
+        html += "<li><a href=\"/sdcard?path=" + parent + "\">[..]</a></li>";
+    }
+    File f = dir.openNextFile();
+    while (f) {
+        String name = String(f.name());
+        String full = path + "/" + name;
+        if (f.isDirectory()) {
+            html += "<li><b>[DIR]</b> <a href=\"/sdcard?path=" + full + "\">" + name + "</a></li>";
+        } else {
+            html += "<li>" + name + " <a href=\"/sdcard/download?file=" + full + "\">[POBIERZ]</a> <a href=\"/sdcard/delete?file=" + full + "\">[USUN]</a></li>";
+        }
+        f = dir.openNextFile();
+    }
+    html += "</ul>";
+}
+
+void handleSDCard() {
+    String path = server.hasArg("path") ? server.arg("path") : "/";
+    path = safePath(path);
+    String html = "<html><head><meta charset='UTF-8'><style>body{background:#111;color:#eee;font-family:Arial;padding:20px;}a{color:#4CAF50;text-decoration:none;}.card{background:#222;padding:15px;margin-bottom:20px;border-radius:10px;}button{background:#4CAF50;color:#fff;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;}</style></head><body><h2>SD Card Manager</h2>";
+    html += "<div class='card'><h3>Katalog: " + path + "</h3>"; listDirHTML(path, html);
+    html += "</div>";
+    html += "<div class='card'><h3>Utworz folder</h3><form action='/sdcard/mkdir' method='GET'><input type='hidden' name='path' value='" + path + "'><input type='text' name='name' placeholder='nazwa folderu'><button type='submit'>Utworz</button></form></div>";
+    html += "<div class='card'><h3>Wyslij plik</h3><form method='POST' action='/sdcard/upload' enctype='multipart/form-data'><input type='hidden' name='path' value='" + path + "'><input type='file' name='upload'><button type='submit'>Wyslij</button></form></div>";
+    html += "<div class='card'><a href='/panel'><button>Powrot do Panelu</button></a></div></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleSDDownload() { 
+    if (!server.hasArg("file")) { server.send(400, "text/plain", "Brak parametru"); return; } 
+    File f = SD_MMC.open(safePath(server.arg("file"))); 
+    if (!f) { server.send(404, "text/plain", "Nie istnieje"); return; } 
+    server.streamFile(f, "application/octet-stream"); 
+    f.close(); 
+}
+
+void handleSDDelete() { 
+    if (SD_MMC.remove(safePath(server.arg("file")))) server.send(200, "text/plain", "Usunieto");
+    else server.send(500, "text/plain", "Blad"); 
+}
+
+void handleSDMkdir() { 
+    if (SD_MMC.mkdir(safePath(server.arg("path")) + "/" + server.arg("name"))) server.send(200, "text/plain", "Utworzono");
+    else server.send(500, "text/plain", "Blad"); 
+}
+
+void handleSDUpload() {
+    HTTPUpload& upload = server.upload(); 
+    String p = server.hasArg("path") ? safePath(server.arg("path")) : "/";
+    if (upload.status == UPLOAD_FILE_START) { 
+        File f = SD_MMC.open(p + "/" + upload.filename, FILE_WRITE);
+        if (f) f.close(); 
+    }
+    else if (upload.status == UPLOAD_FILE_WRITE) { 
+        File f = SD_MMC.open(p + "/" + upload.filename, FILE_APPEND);
+        if (f) { f.write(upload.buf, upload.currentSize); f.close(); } 
+    }
+    else if (upload.status == UPLOAD_FILE_END) { 
+        server.send(200, "text/plain", "Upload OK");
+    }
+}
+
+// ================== PANEL ==================
+String generatePanelHTML() {
+    String html = R"rawliteral(
+    <html><head><meta charset="UTF-8"><style>
+    body{background:#111;color:#eee;font-family:Arial;padding:20px;}
+    h2{color:#4CAF50;} .card{background:#222;padding:15px;margin-bottom:20px;border-radius:10px;}
+    button{background:#4CAF50;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;margin:5px 0;}
+    button:hover{background:#45a049;} a{color:#4CAF50;text-decoration:none;}
+    input[type=range]{width: 100%;} input[type=text]{padding:8px; border-radius:4px; border:1px solid #555; background:#333; color:white;}
+    </style></head><body>
+    <h2>Panel administracyjny ESP32 (Stabilny)</h2>
+    )rawliteral";
+    
+    html += R"rawliteral(
+    <div class="card"><h3>Odtwarzacz Spotify</h3>
+    <iframe title="Spotify Embed" src="https://open.spotify.com/embed/playlist/0MvhyEvkbVTfrwVK8T3YHt?utm_source=generator" width="100%" height="360" frameBorder="0" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" loading="lazy" style="border-radius:12px;"></iframe>
+    </div>
+    )rawliteral";
+
+    html += "<div class='card'><h3>Tryb tla</h3>Aktualny tryb: " + String(animEnabled ? "Animowane" : "Statyczne") + "<br></div>";
+    
+    html += R"rawliteral(
+    <div class="card"><h3>Ustawienia Wygladu</h3>
+    <form action="/panel/setcolor" method="GET">
+    Kolor Paska: <select name="c" style="padding:5px; background:#333; color:white; border-radius:4px;">
+        <option value="green">Zielony</option><option value="red">Czerwony</option>
+        <option value="blue">Niebieski</option><option value="white">Bialy</option>
+        <option value="yellow">Zolty</option>
+    </select> <button type="submit">Zapisz Kolor</button></form><br>
+    )rawliteral";
+    
+    html += "<form action='/panel/setalpha' method='GET'>";
+    html += "Przezroczystosc Tla (0 = Wylaczone, 255 = Czarne):<br><input type='range' name='a' min='0' max='255' value='" + String(dashAlpha) + "'>";
+    html += "<br><button type='submit'>Zapisz przezroczystosc</button></form></div>";
+
+    html += "<div class='card'><h3>Ustawienia Pogody (Wbudowanej)</h3>";
+    html += "<form action='/panel/setcity' method='GET'>";
+    html += "Miasto: <input type='text' name='city' value='" + CITY + "'> ";
+    html += "<button type='submit'>Zapisz miasto</button></form></div>";
+    
+    html += R"rawliteral(
+    <div class="card"><h3>System</h3>
+    <a href="/panel/restart"><button>Restart ESP32</button></a>
+    <a href="/panel/weather"><button>Odswiez pogode teraz</button></a>
+    <a href="/sdcard"><button>Menedzer plikow SD</button></a></div>
+    </body></html>)rawliteral";
+    
+    return html;
+}
+
+void sendRefreshAndMessage(String msg) {
+    String resp = "<html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='1;url=/panel'><style>body{background:#111;color:#eee;font-family:Arial;padding:50px;text-align:center;}</style></head><body><h2>" + msg + "</h2><p>Zapisano. Wracam do panelu...</p></body></html>";
+    server.send(200, "text/html", resp);
+}
+
+void handlePanel() { server.send(200, "text/html", generatePanelHTML()); }
+
+void handlePanelSetColor() {
+    if (!server.hasArg("c")) return;
+    String c = server.arg("c");
+    if      (c == "green")  dashColor = 0x07E0;
+    else if (c == "red")    dashColor = 0xF800;
+    else if (c == "blue")   dashColor = 0x001F;
+    else if (c == "white")  dashColor = 0xFFFF;
+    else if (c == "yellow") dashColor = 0xFFE0;
+    preferences.begin("cfg", false); preferences.putUInt("dashColor", dashColor); preferences.end();
+    sendRefreshAndMessage("Zapisano kolor paska!");
+}
+
+void handlePanelSetAlpha() {
+    if (server.hasArg("a")) {
+        dashAlpha = server.arg("a").toInt();
+        preferences.begin("cfg", false); preferences.putUInt("dashAlpha", dashAlpha); preferences.end();
+    }
+    sendRefreshAndMessage("Zapisano przezroczystosc tła!");
+}
+
+void handlePanelSetCity() {
+    if (server.hasArg("city")) {
+        CITY = server.arg("city");
+        preferences.begin("cfg", false); preferences.putString("city", CITY); preferences.end();
+        updateWeather(); 
+    }
+    sendRefreshAndMessage("Zmieniono miasto i odswiezono pogode!");
+}
+
+void handlePanelRestart() { server.send(200, "text/plain", "Restartuje ESP32..."); delay(500); ESP.restart(); }
+void handlePanelWeather() { updateWeather(); sendRefreshAndMessage("Pogoda zaktualizowana!"); }
+
+// ================== SETUP ==================
+void setup() {
+    Serial.begin(115200);
+    lcd.begin();
+    
+    preferences.begin("cfg", true);
+    dashColor = preferences.getUInt("dashColor", 0x07E0);
+    dashAlpha = preferences.getUInt("dashAlpha", 120); 
+    CITY      = preferences.getString("city", "Katowice");
+    preferences.end();
+    
+    frame = (uint16_t*)heap_caps_malloc(SCR_W * SCR_H * 2, MALLOC_CAP_SPIRAM);
+    if (!frame) frame = (uint16_t*)malloc(SCR_W * SCR_H * 2);
+    fbClear();
+    
+    if (!SD_MMC.begin("/sdcard")) {
+        Serial.println("SD init failed");
+        drawStringFB(150, 200, "SD ERROR", 0xF800, 5);
+        fbPush();
+        delay(1000);
+    }
+
+    fbClear();
+    drawStringFB(150, 200, "WiFi CONNECTING...", 0xFFFF, 4);
+    fbPush();
+
+    IPAddress local_IP(192, 168, 100, 227);
+    IPAddress gateway(192, 168, 100, 1);
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress primaryDNS(8, 8, 8, 8);
+    IPAddress secondaryDNS(1, 1, 1, 1);
+    WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+    
+    WiFi.begin(ssid, password);
+    int timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && timeout < 200) {
+        delay(100);
+        timeout++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        String ip = WiFi.localIP().toString();
+        fbClear();
+        drawStringFB(150, 140, "CONNECTED", 0x07E0, 5);
+        drawStringFB(150, 220, "IP:", 0xFFFF, 4);
+        drawStringFB(150, 260, ip, 0xFFFF, 4);
+        drawStringFB(150, 320, "PORT: 8080", 0xFFFF, 4);
+        fbPush();
+        delay(1200);
+    }
+
+    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
+    updateWeather();
+
+    server.on("/update", HTTP_POST, handleUpdate);
+    server.on("/sdcard", HTTP_GET, handleSDCard);
+    server.on("/sdcard/download", HTTP_GET, handleSDDownload);
+    server.on("/sdcard/delete", HTTP_GET, handleSDDelete);
+    server.on("/sdcard/mkdir", HTTP_GET, handleSDMkdir);
+    server.on("/sdcard/upload", HTTP_POST, [](){}, handleSDUpload);
+    server.on("/panel", HTTP_GET, handlePanel);
+    server.on("/panel/setcolor", HTTP_GET, handlePanelSetColor);
+    server.on("/panel/setalpha", HTTP_GET, handlePanelSetAlpha);
+    server.on("/panel/setcity", HTTP_GET, handlePanelSetCity);
+    server.on("/panel/restart", HTTP_GET, handlePanelRestart);
+    server.on("/panel/weather", HTTP_GET, handlePanelWeather);
+    server.on("/", HTTP_GET, [](){ server.send(200, "text/html", "<script>window.location.href='/panel';</script>"); });
+    server.begin();
+}
+
+// ================== LOOP ==================
+void loop() {
+    server.handleClient();
+
+    static unsigned long lastWeather = 0;
+    if (millis() - lastWeather > 600000) { 
+        updateWeather(); 
+        lastWeather = millis();
+    }
+
+    static unsigned long lastUpdate = 0;
+    
+    bool isConnected = (lastDataReceived != 0) && (millis() - lastDataReceived < 10000);
+
+    if (isConnected) {
+        if (millis() - lastUpdate > 33) {
+            if (animEnabled) updateDashboardAnimated();
+            else updateDashboardStatic();
+            lastUpdate = millis();
+        }
+    } else {
+        if (millis() - lastUpdate > 1000) {
+            drawDisconnectedScreen();
+            lastUpdate = millis();
+        }
+    }
+}

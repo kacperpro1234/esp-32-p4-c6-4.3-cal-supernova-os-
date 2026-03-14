@@ -1,0 +1,86 @@
+PS C:\Users\kacpe> while ($true) {
+>>     try {
+>>         # LHM
+>>         $json = Invoke-RestMethod -Uri $LHM_URL -ErrorAction Stop
+>>
+>>         $raw_cpu_t   = Get-LHM-Specific $json "i5-12400F" "Temperatures" "CPU Package"
+>>         $raw_cpu_l   = Get-LHM-Specific $json "i5-12400F" "Load"         "CPU Total"
+>>         $raw_cpu_ghz = Get-LHM-Specific $json "i5-12400F" "Clocks"       "CPU Core #1"
+>>
+>>         $cpu_t   = [math]::Round((To-Double $raw_cpu_t))
+>>         $cpu_l   = [math]::Round((To-Double $raw_cpu_l))
+>>         $cpu_ghz = [math]::Round((To-Double $raw_cpu_ghz) / 1000, 2)
+>>
+>>         # RAM
+>>         $os = Get-CimInstance Win32_OperatingSystem
+>>         $ram_free = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+>>         $ram_used = [math]::Round(($os.TotalVisibleMemorySize / 1MB) - $ram_free, 1)
+>>
+>>         # GPU
+>>         $nv = Read-NvidiaSMI
+>>         if ($nv) {
+>>             $gpu_t = $nv.gpu_t
+>>             $gpu_l = $nv.gpu_l
+>>             $vram_used = $nv.vram_used
+>>             $vram_free = $nv.vram_free
+>>         }
+>>
+>>         # POGODA
+>>         $now = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+>>         if (($now - $lastWeatherTime) -gt 600) {
+>>             try {
+>>                 $geo = Invoke-RestMethod -Uri "https://geocoding-api.open-meteo.com/v1/search?name=$CITY&count=1&language=pl&format=json"
+>>                 $w = Invoke-RestMethod -Uri "https://api.open-meteo.com/v1/forecast?latitude=$($geo.results[0].latitude)&longitude=$($geo.results[0].longitude)&current_weather=true"
+>>                 $weather_temp = "Ø $($w.current_weather.temperature)C"
+>>                 $lastWeatherTime = $now
+>>             } catch {}
+>>         }
+>>
+>>         # SPOTIFY
+>>         $spotify_track = ""
+>>         $spotifyProc = Get-Process spotify -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -ne "" }
+>>         if ($spotifyProc) {
+>>             $title = $spotifyProc.MainWindowTitle
+>>             if ($title -notmatch "^Spotify") { $spotify_track = $title }
+>>         }
+>>
+>>         if ($spotify_track -ne $last_spotify_track) {
+>>             if ($spotify_track -ne "") { $show_cover = Process-And-Upload-Cover $spotify_track }
+>>             else { $show_cover = $false }
+>>             $last_spotify_track = $spotify_track
+>>         }
+>>
+>>         # STEAM — prawdziwa gra + godziny
+>>         $steam = Get-SteamGame
+>>         $steam_game = $steam.name
+>>         $steam_hours = $steam.hours
+>>
+>>         # WYSYŁKA
+>>         $payload = @{
+>>             cpu_t = $cpu_t
+>>             cpu_l = $cpu_l
+>>             cpu_ghz = $cpu_ghz
+>>             gpu_t = $gpu_t
+>>             gpu_l = $gpu_l
+>>             ram_used = $ram_used
+>>             ram_free = $ram_free
+>>             vram_used = $vram_used
+>>             vram_free = $vram_free
+>>             spotify = $spotify_track
+>>             weather_temp = $weather_temp
+>>             weather_desc = "OK"
+>>             show_cover = $show_cover
+>>             steam_game = $steam_game
+>>             steam_hours = $steam_hours
+>>         } | ConvertTo-Json
+>>
+>>         Invoke-RestMethod -Uri "$ESP_IP/update" -Method Post -Body $payload -ContentType "application/json"
+>>
+>>         Write-Host "`rCPU: $cpu_t C | GPU: $gpu_t C | RAM: $ram_used GB | VRAM: $vram_used GB | GRA: $steam_game ($steam_hours h)      " -NoNewline
+>>     }
+>>     catch {
+>>         Write-Host "`r[!] Błąd połączenia z ESP lub LHM..." -NoNewline
+>>     }
+>>
+>>     Start-Sleep -Milliseconds 500
+>> }

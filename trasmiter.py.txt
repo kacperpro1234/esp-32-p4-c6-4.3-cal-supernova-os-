@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# transmitter_final.py
+# Wymagania: requests, psutil, wmi (opcjonalnie na Windows)
+# Instalacja: pip install requests psutil wmi
+
+import requests, psutil, subprocess, time, json, os, platform
+from datetime import datetime
+
+# ========== KONFIGURACJA ==========
+ESP_URL = "http://192.168.100.227:8080/update"   # ustaw IP ESP32
+LHM_URL = "http://localhost:8085/data.json"      # LibreHardwareMonitor
+POLL_INTERVAL = 1.0                              # sekundy
+VERBOSE = True                                   # True -> logi debug
+# Opcjonalnie: STEAM_API_KEY, STEAM_ID jeśli chcesz playtime przez Web API
+STEAM_API_KEY = ""
+STEAM_ID = ""
+
+# ========== IMPORT WMI (Windows) ==========
+try:
+    if platform.system().lower() == "windows":
+        import wmi
+    else:
+        wmi = None
+except Exception:
+    wmi = None
+
+# ========== POMOCNICZE ==========
+def dbg(*args, **kwargs):
+    if VERBOSE:
+        print(datetime.now().strftime("[%H:%M:%S]"), *args, **kwargs)
+
+def safe_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+# ========== LHM (LibreHardwareMonitor) ==========
+def read_lhm():
+    try:
+        r = requests.get(LHM_URL, timeout=1.0)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        dbg("LHM read error:", e)
+    return None
+
+def find_hw_node(lhm_json, keyword):
+    try:
+        root = lhm_json.get("Children", [])
+        if not root:
+            return None
+        hw_list = root[0].get("Children", [])
+        for hw in hw_list:
+            text = (hw.get("Text") or "")
+            if keyword.lower() in text.lower():
+                return hw
+        # fallback: search inside children texts
+        for hw in hw_list:
+            for child in hw.get("Children", []):
+                if keyword.lower() in (child.get("Text","") or "").lower():
+                    return hw
+    except Exception:
+        pass
+    return None
+
+def get_sensor_value(hw_node, category_name, sensor_name):
+    try:
+        if not hw_node:
+            return None
+        cats = hw_node.get("Children", [])
+        for c in cats:
+            if (c.get("Text") or "").lower() == category_name.lower():
+                for s in c.get("Children", []):
+                    if (s.get("Text") or "").lower() == sensor_name.lower():
+                        return s.get("Value")
+        # fallback: contains
+        for c in cats:
+            for s in c.get("Children", []):
+                if sensor_name.lower() in (s.get("Text") or "").lower():
+                    return s.get("Value")
+    except Exception:
+        pass
+    return None
+
+# ========== NVIDIA SMI ==========
+def read_nvidia_smi():
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.free", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, timeout=1.0
+        )
+        line = out.decode(errors="ignore").strip().splitlines()[0]
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 4:
+            t = safe_float(parts[0], -1)
+            load = safe_float(parts[1], 0)
+            mem_used_mb = safe_float(parts[2], 0)
+            mem_free_mb = safe_float(parts[3], 0)
+            return int(round(t)), int(round(load)), round(mem_used_mb/1024.0,1), round(mem_free_mb/1024.0,1)
+    except Exception as e:
+        dbg("nvidia-smi error:", e)
+    return None
+
+# ========== RAM ==========
+def get_ram():
+    vm = psutil.virtual_memory()
+    used_gb = (vm.total - vm.available) / (1024**3)
+    free_gb = vm.available / (1024**3)
+    return round(used_gb,1), round(free_gb,1)
+
+# ========== FALLBACK CPU LOAD & CLOCK ==========
+def get_cpu_load_fallback():
+    try:
+        return int(round(psutil.cpu_percent(interval=0.5)))
+    except Exception:
+        return 0
+
+def get_cpu_ghz_fallback():
+    try:
+        if platform.system().lower() == "windows" and wmi is not None:
+            c = wmi.WMI()
+            for cpu in c.Win32_Processor():
+                clk_mhz = getattr(cpu, "CurrentClockSpeed", None)
+                if clk_mhz:
+                    return round(float(clk_mhz) / 1000.0, 2)
+    except Exception as e:
+        dbg("WMI clock error:", e)
+    return 0.0
+
+# ========== STEAM DETECTION (lokalny) ==========
+def get_steam_game_local():
+    steam_proc = None
+    for p in psutil.process_iter(["name","pid"]):
+        try:
+            if p.info["name"] and p.info["name"].lower().startswith("steam"):
+                steam_proc = p
+                break
+        except Exception:
+            continue
+    if not steam_proc:
+        return ("Brak gry", 0.0, 0)
+    steam_pid = steam_proc.pid
+    children = []
+    for p in psutil.process_iter(["pid","name","cmdline"]):
+        try:
+            if p.ppid() == steam_pid:
+                children.append(p)
+        except Exception:
+            continue
+    if children:
+        chosen = children[0]
+        name = chosen.name()
+        cmd = ""
+        try:
+            cmd = " ".join(chosen.cmdline())
+        except Exception:
+            cmd = ""
+        pretty = name
+        if cmd:
+            pretty = os.path.basename(cmd.split()[0])
+        # jeśli MainWindowTitle potrzebny -> można dodać przez pywin32, tu prosty fallback
+        return (pretty, 0.0, 0)
+    return ("Brak gry", 0.0, 0)
+
+# ========== SEND ==========
+def send_to_esp(payload):
+    try:
+        r = requests.post(ESP_URL, json=payload, timeout=1.5)
+        if r.status_code == 200:
+            return True
+        else:
+            dbg("ESP returned", r.status_code, r.text)
+    except Exception as e:
+        dbg("ESP send error:", e)
+    return False
+
+# ========== GŁÓWNA PĘTLA ==========
+def main_loop():
+    while True:
+        cpu_t = -1; cpu_l = 0; cpu_ghz = 0.0
+        gpu_t = -1; gpu_l = 0; vram_used = 0.0; vram_free = 0.0
+
+        lhm = read_lhm()
+        if lhm:
+            cpu_node = find_hw_node(lhm, "cpu")
+            gpu_node = find_hw_node(lhm, "gpu")
+
+            # temperatura CPU: rozszerzona lista kandydatów
+            cpu_candidates = [
+                "CPU Package","Package","CPU Core #1","CPU Core 0",
+                "CPU (Tctl)","CPU","Package (Tctl)","CPU Package (Tctl)",
+                "Core 0","Core 1","Core 2","Core 3"
+            ]
+            cat_names = ["Temperatures","Temperature","Temperatures "]
+            found_temp = False
+            for cat in cat_names:
+                for cand in cpu_candidates:
+                    v = get_sensor_value(cpu_node, cat, cand)
+                    if v is not None:
+                        cpu_t = int(round(safe_float(v, -1)))
+                        found_temp = True
+                        break
+                if found_temp: break
+            if not found_temp:
+                try:
+                    dbg("DEBUG cpu_node fragment:", json.dumps(cpu_node, ensure_ascii=False)[:2000])
+                except Exception:
+                    dbg("DEBUG cpu_node: cannot dump")
+
+            # load CPU
+            raw_cpu_l = None
+            for cand in ["CPU Total","CPU","Total","Load","CPU Usage"]:
+                val = get_sensor_value(cpu_node, "Load", cand)
+                if val is not None:
+                    raw_cpu_l = val
+                    break
+            if raw_cpu_l is not None:
+                cpu_l = int(round(safe_float(raw_cpu_l, 0)))
+            else:
+                cpu_l = get_cpu_load_fallback()
+
+            # clock CPU
+            raw_cpu_ghz = None
+            for cand in ["CPU Core #1","CPU","Core #1","Clock","Clocks","CPU Clock"]:
+                raw_cpu_ghz = get_sensor_value(cpu_node, "Clocks", cand) or raw_cpu_ghz
+            if raw_cpu_ghz is not None:
+                cpu_ghz = round(safe_float(raw_cpu_ghz, 0.0)/1000.0, 2)
+            else:
+                cpu_ghz = get_cpu_ghz_fallback()
+        else:
+            # brak LHM: fallbacky
+            cpu_l = get_cpu_load_fallback()
+            cpu_ghz = get_cpu_ghz_fallback()
+
+        # nvidia-smi override
+        nv = read_nvidia_smi()
+        if nv:
+            gpu_t, gpu_l, vram_used, vram_free = nv
+
+        ram_used, ram_free = get_ram()
+
+        # steam detection (lokalny)
+        steam_game = "Brak gry"; steam_hours = 0.0; steam_appid = 0
+        s_local = get_steam_game_local()
+        if s_local:
+            steam_game, steam_hours, steam_appid = s_local
+
+        payload = {
+            "cpu_t": int(cpu_t) if cpu_t is not None else -1,
+            "cpu_l": int(cpu_l),
+            "cpu_ghz": float(cpu_ghz),
+            "gpu_t": int(gpu_t) if gpu_t is not None else -1,
+            "gpu_l": int(gpu_l),
+            "ram_used": float(ram_used),
+            "ram_free": float(ram_free),
+            "vram_used": float(vram_used),
+            "vram_free": float(vram_free),
+            "spotify": "",
+            "weather_temp": "--C",
+            "weather_desc": "",
+            "steam_game": steam_game,
+            "steam_hours": float(steam_hours),
+            "steam_appid": int(steam_appid)
+        }
+
+        dbg("Payload:", json.dumps(payload, ensure_ascii=False))
+        ok = send_to_esp(payload)
+        if not ok:
+            dbg("Send failed")
+        time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\nStopped by user")

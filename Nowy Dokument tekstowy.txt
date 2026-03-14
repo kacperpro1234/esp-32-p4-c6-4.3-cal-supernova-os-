@@ -1,0 +1,176 @@
+# =========================================================
+# TRANSMITER V11 - PANCERNA EDYCJA (FIX VRAM + SPOTIFY)
+# =========================================================
+Add-Type -AssemblyName System.Drawing
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# --- KONFIGURACJA ---
+$ESP_IP = "http://192.168.100.227:8080"
+$LHM_URL = "http://localhost:8085/data.json"
+$CITY = "Katowice"
+
+# --- TWOJE KLUCZE SPOTIFY ---
+$SpotifyClientID = "47d60c56bc88439d820f30c3495af91f"
+$SpotifyClientSecret = "fe10bfb6f6b0485cb93184060ff3b085"
+
+# --- ZMIENNE POMOCNICZE ---
+$lastWeatherTime = 0
+$weather_temp = "--C"
+$weather_desc = "Czekam..."
+$last_spotify_track = ""
+$show_cover = $false
+
+# FUNKCJA POMOCNICZA: Bezpieczna zamiana tekstu na liczbe (Double)
+function To-Double ($val) {
+    if ($null -eq $val -or $val -eq "") { return 0.0 }
+    try {
+        # Zamien kropke na przecinek (lub odwrotnie) i wyczysc tekst
+        $clean = $val -replace '[^\d.,]', ''
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        return [double]::Parse($clean.Replace(',', '.'), $culture)
+    } catch { return 0.0 }
+}
+
+function Get-LHM-Specific {
+    param($data, $hwName, $categoryName, $sensorName)
+    try {
+        $hw = $data.Children[0].Children | Where-Object { $_.Text -like "*$hwName*" }
+        if (-not $hw) { return $null }
+        $cat = $hw.Children | Where-Object { $_.Text -eq $categoryName }
+        if (-not $cat) { return $null }
+        $sensor = $cat.Children | Where-Object { $_.Text -eq $sensorName }
+        return $sensor.Value
+    } catch { return $null }
+}
+
+function Get-SpotifyToken {
+    try {
+        $authBytes = [System.Text.Encoding]::UTF8.GetBytes("${SpotifyClientID}:${SpotifyClientSecret}")
+        $authB64 = [System.Convert]::ToBase64String($authBytes)
+        $tokenRes = Invoke-RestMethod -Uri "https://accounts.spotify.com/api/token" -Method Post -Headers @{Authorization="Basic $authB64"} -Body @{grant_type="client_credentials"} -ErrorAction Stop
+        return $tokenRes.access_token
+    } catch { return $null }
+}
+
+function Process-And-Upload-Cover($trackName) {
+    try {
+        $token = Get-SpotifyToken
+        if (-not $token) { return $false }
+
+        $safeQuery = [uri]::EscapeDataString($trackName)
+        $searchRes = Invoke-RestMethod -Uri "https://api.spotify.com/v1/search?q=$safeQuery&type=track&limit=1" -Headers @{Authorization="Bearer $token"} -ErrorAction Stop
+        
+        if ($searchRes.tracks.items.Count -eq 0) { return $false }
+        
+        $coverUrl = $searchRes.tracks.items[0].album.images[0].url
+        $imgBytes = Invoke-RestMethod -Uri $coverUrl
+        $ms = New-Object System.IO.MemoryStream(,$imgBytes)
+        $coverImg = [System.Drawing.Image]::FromStream($ms)
+
+        $scaledCover = New-Object System.Drawing.Bitmap(480, 480)
+        $g1 = [System.Drawing.Graphics]::FromImage($scaledCover)
+        $g1.DrawImage($coverImg, 0, 0, 480, 480)
+        $scaledCover.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipNone)
+
+        $canvas = New-Object System.Drawing.Bitmap(480, 800)
+        $g2 = [System.Drawing.Graphics]::FromImage($canvas)
+        $g2.Clear([System.Drawing.Color]::Black)
+        $g2.DrawImage($scaledCover, 0, 160, 480, 480)
+
+        $bmpPath = "$env:TEMP\cover.bmp"
+        $canvas.Save($bmpPath, [System.Drawing.Imaging.ImageFormat]::Bmp)
+
+        $g1.Dispose(); $g2.Dispose(); $scaledCover.Dispose(); $canvas.Dispose(); $coverImg.Dispose(); $ms.Dispose()
+
+        Invoke-RestMethod -Uri "$ESP_IP/sdcard/mkdir?path=/&name=spotify" -Method Get -ErrorAction SilentlyContinue | Out-Null
+        curl.exe -s -F "upload=@$bmpPath" -F "path=/spotify" "$ESP_IP/sdcard/upload" | Out-Null
+        
+        Remove-Item $bmpPath -ErrorAction SilentlyContinue
+        return $true
+    } catch { return $false }
+}
+
+Clear-Host
+Write-Host ">>> TRANSMITER V11 START (FIX VRAM) <<<" -ForegroundColor Yellow
+
+while ($true) {
+    try {
+        # 1. Pobieranie danych z LibreHardwareMonitor
+        $json = Invoke-RestMethod -Uri $LHM_URL -ErrorAction Stop
+        
+        # Pobieranie wartosci jako tekst i bezpieczna konwersja
+        $raw_cpu_t = Get-LHM-Specific $json "i5-12400F" "Temperatures" "CPU Package"
+        $raw_cpu_l = Get-LHM-Specific $json "i5-12400F" "Load" "CPU Total"
+        $raw_cpu_ghz = Get-LHM-Specific $json "i5-12400F" "Clocks" "CPU Core #1"
+
+        $cpu_t = [math]::Round((To-Double $raw_cpu_t))
+        $cpu_l = [math]::Round((To-Double $raw_cpu_l))
+        $cpu_ghz = [math]::Round((To-Double $raw_cpu_ghz) / 1000, 2)
+
+        # RAM
+        $os = Get-CimInstance Win32_OperatingSystem
+        $ram_free = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+        $ram_used = [math]::Round(($os.TotalVisibleMemorySize / 1MB) - $ram_free, 1)
+
+        # GPU i VRAM (NAPRAWIONE)
+        $gpu_t = 0; $gpu_l = 0; $vram_used = 0; $vram_free = 0
+        try {
+            # Pobieramy uzyta ORAZ wolna pamiec (memory.free wraca do gry)
+            $nv = (nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.free --format=csv,noheader,nounits 2>$null) | Select-Object -First 1
+            if ($nv) {
+                $nv_p = $nv -split ','
+                $gpu_t = [math]::Round((To-Double $nv_p[0]))
+                $gpu_l = [math]::Round((To-Double $nv_p[1]))
+                $vram_used = [math]::Round((To-Double $nv_p[2]) / 1024, 1)
+                $vram_free = [math]::Round((To-Double $nv_p[3]) / 1024, 1) # <--- Tutaj naprawiony VRAM Free
+            }
+        } catch {}
+
+        # 2. POGODA
+        $now = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        if (($now - $lastWeatherTime) -gt 600) {
+            try {
+                $geo = Invoke-RestMethod -Uri "https://geocoding-api.open-meteo.com/v1/search?name=$CITY&count=1&language=pl&format=json"
+                if ($geo.results) {
+                    $w = Invoke-RestMethod -Uri "https://api.open-meteo.com/v1/forecast?latitude=$($geo.results[0].latitude)&longitude=$($geo.results[0].longitude)&current_weather=true"
+                    $weather_temp = "Ø " + [string]$w.current_weather.temperature + "C"
+                    $lastWeatherTime = $now
+                }
+            } catch { $lastWeatherTime = $now - 500 }
+        }
+
+        # 3. SPOTIFY
+        $spotify_track = ""
+        $spotifyProc = Get-Process spotify -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -ne "" }
+        if ($spotifyProc) {
+            $title = $spotifyProc.MainWindowTitle
+            if ($title -notmatch "^Spotify( Premium| Free)?$") { $spotify_track = $title }
+        }
+
+        if ($spotify_track -ne $last_spotify_track) {
+            Write-Host "`n[*] Zmiana utworu: $spotify_track" -ForegroundColor Cyan
+            if ($spotify_track -ne "") { $show_cover = Process-And-Upload-Cover -trackName $spotify_track }
+            else { $show_cover = $false }
+            $last_spotify_track = $spotify_track
+        }
+
+        # 4. WYSYŁKA DO ESP32
+        $payload = @{
+            cpu_t = $cpu_t; cpu_l = $cpu_l; cpu_ghz = $cpu_ghz
+            gpu_t = $gpu_t; gpu_l = $gpu_l; ram_used = $ram_used; ram_free = $ram_free
+            vram_used = $vram_used; vram_free = $vram_free; spotify = $spotify_track
+            weather_temp = $weather_temp; weather_desc = "OK"
+            show_cover = $show_cover
+        } | ConvertTo-Json
+
+        Invoke-RestMethod -Uri "$ESP_IP/update" -Method Post -Body $payload -ContentType "application/json" -TimeoutSec 1 > $null
+
+        # Podgląd w konsoli
+        $status = "`rCPU: $cpu_t C | GPU: $gpu_t C | RAM: $ram_used GB | VRAM: $vram_used GB | POGODA: $weather_temp      "
+        Write-Host $status -NoNewline
+    }
+    catch {
+        Write-Host "`r[!] Brak polaczenia z ESP lub LHM...             " -NoNewline -ForegroundColor Gray
+    }
+    Start-Sleep -Milliseconds 500
+}
